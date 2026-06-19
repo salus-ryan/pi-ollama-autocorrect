@@ -13,9 +13,9 @@ const GHOST_DEBOUNCE_MS = 900;
 const GHOST_MIN_CHARS = 8;
 const PREDICTION_MIN_CHARS = 16;
 
-// Fast enough for live ghost text. /autocorrect-race uses the longer list below.
-// Live racing multiple models made the textbox feel broken on-device because
-// Ollama queues/contends the generations. Keep live ghost fast; race manually.
+// Keep live typing to one Ollama request at a time. On-device Ollama usually queues
+// generations, so racing autocorrect + prediction while typing can hide prediction.
+// Autocorrect remains available via Tab after manual command/shortcut and /autocorrect.
 const GHOST_MODEL = "llama3.2:latest";
 const PREDICTION_MODEL = "llama3.2:latest";
 const FULL_RACE_MODELS = ["qwen2.5-coder:1.5b", "llama3.2:latest", "mistral:latest", "phi:latest"];
@@ -352,56 +352,32 @@ export default function (pi: ExtensionAPI) {
         const id = ++this.requestId;
         const controller = new AbortController();
         this.abort = controller;
-        const correctionStart = Date.now();
         const predictionStart = Date.now();
+        this.correctionGhost = "";
+        this.correctionMeta = "";
         this.predictionGhost = "…";
         this.predictionMeta = ` ${PREDICTION_MODEL}`;
         this.tui.requestRender();
 
-        const [correction, prediction] = await Promise.allSettled([
-          askOllama(text, GHOST_MODEL, controller.signal),
-          trimmed.length >= PREDICTION_MIN_CHARS
-            ? predictNext(text, PREDICTION_MODEL, controller.signal)
-            : Promise.resolve(""),
-        ]);
+        try {
+          const prediction = trimmed.length >= PREDICTION_MIN_CHARS
+            ? await predictNext(text, PREDICTION_MODEL, controller.signal)
+            : "";
 
-        if (id !== this.requestId || controller.signal.aborted) return;
+          if (id !== this.requestId || controller.signal.aborted) return;
 
-        if (correction.status === "fulfilled") {
-          const corrected = correction.value;
-          const candidate: RaceCandidate = { model: GHOST_MODEL, text: corrected, ms: Date.now() - correctionStart };
-          const result: RaceResult = {
-            input: text,
-            winner: corrected || text,
-            agreement: corrected ? 1 : 0,
-            total: corrected ? 1 : 0,
-            candidates: [candidate],
-          };
-          this.lastRace = result;
-          storeRace(pi, result, false);
-
-          if (corrected && corrected !== text) {
-            this.correctionGhost = corrected;
-            this.correctionMeta = ` ${GHOST_MODEL} ${candidate.ms}ms`;
+          if (prediction) {
+            this.predictionGhost = prediction;
+            this.predictionMeta = ` ${PREDICTION_MODEL} ${Date.now() - predictionStart}ms`;
           } else {
-            this.correctionGhost = "";
-            this.correctionMeta = "";
+            this.predictionGhost = "";
+            this.predictionMeta = "";
           }
-        } else {
-          this.correctionGhost = "";
-          this.correctionMeta = "";
-        }
-
-        if (prediction.status === "fulfilled" && prediction.value) {
-          this.predictionGhost = prediction.value;
-          this.predictionMeta = ` ${PREDICTION_MODEL} ${Date.now() - predictionStart}ms`;
-        } else if (prediction.status === "rejected") {
-          const message = prediction.reason instanceof Error ? prediction.reason.message : String(prediction.reason);
+        } catch (error) {
+          if (id !== this.requestId) return;
+          const message = error instanceof Error ? error.message : String(error);
           this.predictionGhost = "prediction unavailable";
           this.predictionMeta = ` ${PREDICTION_MODEL}: ${message.slice(0, 80)}`;
-        } else {
-          this.predictionGhost = "";
-          this.predictionMeta = "";
         }
 
         this.tui.requestRender();
@@ -483,6 +459,6 @@ export default function (pi: ExtensionAPI) {
     }
 
     ctx.ui.setEditorComponent((tui, theme, keybindings) => new OllamaGhostEditor(tui, theme, keybindings));
-    ctx.ui.notify("Ollama autocorrect loaded: Tab accepts fix, Ctrl+Space accepts prediction", "info");
+    ctx.ui.notify("Ollama prediction loaded: one live model, Ctrl+Space accepts inline ghost", "info");
   });
 }

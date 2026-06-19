@@ -4,10 +4,10 @@ Local Ollama-powered autocorrect for the Pi textbox.
 
 ## Features
 
-- dim gray ghost correction while you type
-- second ghost line predicts what you may type next
-- `Tab` accepts the autocorrect ghost
+- one live Ollama model while typing for better responsiveness
+- dim gray inline prediction at the cursor
 - `Ctrl+Space` accepts the prediction ghost
+- `Tab` accepts an autocorrect ghost when available
 - `Ctrl+Shift+A` runs/apply autocorrect manually
 - `/autocorrect [model]`
 - `/predict [model]`
