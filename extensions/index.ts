@@ -84,7 +84,7 @@ async function predictNext(original: string, model = PREDICTION_MODEL, signal?: 
         "Predict only the next short phrase or sentence the user is likely to type.",
         "Preserve the user's tone and context. Do not answer the user. Do not explain.",
         "Return only the continuation text, not the original text.",
-        "If no useful continuation is obvious, return an empty string.",
+        "Always return a plausible continuation, even if you are uncertain.",
         "",
         "Text so far:",
         original,
@@ -101,7 +101,9 @@ async function predictNext(original: string, model = PREDICTION_MODEL, signal?: 
   }
 
   const data = (await response.json()) as { response?: string };
-  return data.response?.trim() ?? "";
+  const raw = data.response?.trim() ?? "";
+  const withoutQuotes = raw.replace(/^['"“”]+|['"“”]+$/g, "");
+  return withoutQuotes.startsWith(original) ? withoutQuotes.slice(original.length).trim() : withoutQuotes;
 }
 
 async function raceAutocorrect(input: string, models: string[], signal?: AbortSignal): Promise<RaceResult> {
@@ -352,6 +354,9 @@ export default function (pi: ExtensionAPI) {
         this.abort = controller;
         const correctionStart = Date.now();
         const predictionStart = Date.now();
+        this.predictionGhost = "…";
+        this.predictionMeta = ` ${PREDICTION_MODEL}`;
+        this.tui.requestRender();
 
         const [correction, prediction] = await Promise.allSettled([
           askOllama(text, GHOST_MODEL, controller.signal),
@@ -390,6 +395,10 @@ export default function (pi: ExtensionAPI) {
         if (prediction.status === "fulfilled" && prediction.value) {
           this.predictionGhost = prediction.value;
           this.predictionMeta = ` ${PREDICTION_MODEL} ${Date.now() - predictionStart}ms`;
+        } else if (prediction.status === "rejected") {
+          const message = prediction.reason instanceof Error ? prediction.reason.message : String(prediction.reason);
+          this.predictionGhost = "prediction unavailable";
+          this.predictionMeta = ` ${PREDICTION_MODEL}: ${message.slice(0, 80)}`;
         } else {
           this.predictionGhost = "";
           this.predictionMeta = "";
