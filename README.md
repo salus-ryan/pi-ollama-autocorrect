@@ -22,7 +22,7 @@ Local Ollama-powered autocorrect/prediction for the Pi textbox, with optional Op
 
 - Pi coding agent
 - Ollama running locally on `127.0.0.1:11434`
-- default autocorrect/live fix model: `llama3.2:latest`
+- default autocorrect/live fix model: `qwen2.5:0.5b`
 - default live prediction model: `qwen2.5:0.5b`
 - optional OpenRouter API key in `OPENROUTER_API_KEY`
 

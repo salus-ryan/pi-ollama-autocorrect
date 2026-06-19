@@ -7,7 +7,7 @@ import {
 import type { EditorTheme, TUI } from "@earendil-works/pi-tui";
 import { CURSOR_MARKER, Key, matchesKey, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 
-const DEFAULT_MODEL = "llama3.2:latest";
+const DEFAULT_MODEL = "qwen2.5:0.5b";
 const OLLAMA_URL = "http://127.0.0.1:11434/api/generate";
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 const OPENROUTER_DEFAULT_MODEL = "openai/gpt-4o-mini";
@@ -18,9 +18,9 @@ const PREDICTION_MIN_CHARS = 16;
 // Keep live typing to one Ollama request at a time. On-device Ollama usually queues
 // generations, so racing autocorrect + prediction while typing can hide prediction.
 // Autocorrect remains available via Tab after manual command/shortcut and /autocorrect.
-const GHOST_MODEL = "llama3.2:latest";
+const GHOST_MODEL = "qwen2.5:0.5b";
 const PREDICTION_MODEL = "qwen2.5:0.5b";
-const FULL_RACE_MODELS = ["qwen2.5-coder:1.5b", "llama3.2:latest", "mistral:latest", "phi:latest"];
+const FULL_RACE_MODELS = ["qwen2.5:0.5b", "qwen2.5-coder:1.5b", "llama3.2:latest", "mistral:latest", "phi:latest"];
 const PREDICTION_RACE_MODELS = ["ollama:qwen2.5:0.5b", "ollama:llama3.2:latest", `openrouter:${OPENROUTER_DEFAULT_MODEL}`];
 const TELEMETRY_TYPE = "ai-native-typing-telemetry";
 
