@@ -9,6 +9,8 @@ import { CURSOR_MARKER, Key, matchesKey, wrapTextWithAnsi } from "@earendil-work
 
 const DEFAULT_MODEL = "llama3.2:latest";
 const OLLAMA_URL = "http://127.0.0.1:11434/api/generate";
+const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
+const OPENROUTER_DEFAULT_MODEL = "openai/gpt-4o-mini";
 const GHOST_DEBOUNCE_MS = 900;
 const GHOST_MIN_CHARS = 8;
 const PREDICTION_MIN_CHARS = 16;
@@ -19,6 +21,7 @@ const PREDICTION_MIN_CHARS = 16;
 const GHOST_MODEL = "llama3.2:latest";
 const PREDICTION_MODEL = "llama3.2:latest";
 const FULL_RACE_MODELS = ["qwen2.5-coder:1.5b", "llama3.2:latest", "mistral:latest", "phi:latest"];
+const PREDICTION_RACE_MODELS = ["ollama:llama3.2:latest", `openrouter:${OPENROUTER_DEFAULT_MODEL}`];
 
 type RaceCandidate = {
   model: string;
@@ -37,6 +40,15 @@ type RaceResult = {
 
 function normalizeForAgreement(text: string): string {
   return text.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+function getEnv(name: string): string | undefined {
+  return (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env?.[name];
+}
+
+function cleanContinuation(original: string, raw: string): string {
+  const withoutQuotes = raw.trim().replace(/^['"“”]+|['"“”]+$/g, "");
+  return withoutQuotes.startsWith(original) ? withoutQuotes.slice(original.length).trim() : withoutQuotes;
 }
 
 async function askOllama(original: string, model = DEFAULT_MODEL, signal?: AbortSignal): Promise<string> {
@@ -101,9 +113,76 @@ async function predictNext(original: string, model = PREDICTION_MODEL, signal?: 
   }
 
   const data = (await response.json()) as { response?: string };
-  const raw = data.response?.trim() ?? "";
-  const withoutQuotes = raw.replace(/^['"“”]+|['"“”]+$/g, "");
-  return withoutQuotes.startsWith(original) ? withoutQuotes.slice(original.length).trim() : withoutQuotes;
+  return cleanContinuation(original, data.response ?? "");
+}
+
+async function predictNextOpenRouter(
+  original: string,
+  model = OPENROUTER_DEFAULT_MODEL,
+  signal?: AbortSignal,
+): Promise<string> {
+  const apiKey = getEnv("OPENROUTER_API_KEY");
+  if (!apiKey) throw new Error("OPENROUTER_API_KEY is not set");
+
+  const response = await fetch(OPENROUTER_URL, {
+    method: "POST",
+    headers: {
+      "authorization": `Bearer ${apiKey}`,
+      "content-type": "application/json",
+      "http-referer": "https://github.com/salus-ryan/pi-ollama-autocorrect",
+      "x-title": "pi-ollama-autocorrect",
+    },
+    signal,
+    body: JSON.stringify({
+      model,
+      temperature: 0.2,
+      max_tokens: 48,
+      messages: [
+        {
+          role: "system",
+          content: [
+            "You are a typing continuation engine for a coding-agent input textbox.",
+            "Predict only the next short phrase or sentence the user is likely to type.",
+            "Preserve the user's tone and context. Do not answer the user. Do not explain.",
+            "Return only the continuation text, not the original text.",
+            "Always return a plausible continuation, even if you are uncertain.",
+          ].join(" "),
+        },
+        { role: "user", content: `Text so far:\n${original}` },
+      ],
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`OpenRouter HTTP ${response.status}: ${await response.text()}`);
+  }
+
+  const data = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
+  return cleanContinuation(original, data.choices?.[0]?.message?.content ?? "");
+}
+
+async function predictNextWithSpec(original: string, spec: string, signal?: AbortSignal): Promise<string> {
+  if (spec.startsWith("openrouter:")) return predictNextOpenRouter(original, spec.slice("openrouter:".length), signal);
+  if (spec.startsWith("ollama:")) return predictNext(original, spec.slice("ollama:".length), signal);
+  return predictNext(original, spec, signal);
+}
+
+function chooseRaceWinner(input: string, candidates: RaceCandidate[]): RaceResult {
+  const counts = new Map<string, { text: string; count: number; firstIndex: number }>();
+  for (const [i, candidate] of candidates.entries()) {
+    if (!candidate.text) continue;
+    const key = normalizeForAgreement(candidate.text);
+    const existing = counts.get(key);
+    if (existing) existing.count++;
+    else counts.set(key, { text: candidate.text, count: 1, firstIndex: i });
+  }
+
+  const ranked = [...counts.values()].sort((a, b) => b.count - a.count || a.firstIndex - b.firstIndex);
+  const winner = ranked[0]?.text ?? "";
+  const agreement = ranked[0]?.count ?? 0;
+  const total = candidates.filter((candidate) => candidate.text).length;
+
+  return { input, winner, agreement, total, candidates };
 }
 
 async function raceAutocorrect(input: string, models: string[], signal?: AbortSignal): Promise<RaceResult> {
@@ -120,25 +199,41 @@ async function raceAutocorrect(input: string, models: string[], signal?: AbortSi
     }),
   );
 
-  const counts = new Map<string, { text: string; count: number; firstIndex: number }>();
-  for (const [i, candidate] of candidates.entries()) {
-    if (!candidate.text) continue;
-    const key = normalizeForAgreement(candidate.text);
-    const existing = counts.get(key);
-    if (existing) existing.count++;
-    else counts.set(key, { text: candidate.text, count: 1, firstIndex: i });
-  }
+  const result = chooseRaceWinner(input, candidates);
+  return { ...result, winner: result.winner || input };
+}
 
-  const ranked = [...counts.values()].sort((a, b) => b.count - a.count || a.firstIndex - b.firstIndex);
-  const winner = ranked[0]?.text ?? input;
-  const agreement = ranked[0]?.count ?? 0;
-  const total = candidates.filter((candidate) => candidate.text).length;
+async function racePrediction(input: string, models: string[], signal?: AbortSignal): Promise<RaceResult> {
+  const candidates = await Promise.all(
+    models.map(async (model): Promise<RaceCandidate> => {
+      const start = Date.now();
+      try {
+        const text = await predictNextWithSpec(input, model, signal);
+        return { model, text, ms: Date.now() - start };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { model, error: message, ms: Date.now() - start };
+      }
+    }),
+  );
 
-  return { input, winner, agreement, total, candidates };
+  return chooseRaceWinner(input, candidates);
 }
 
 function storeRace(pi: ExtensionAPI, result: RaceResult, accepted?: boolean) {
   pi.appendEntry("ollama-autocorrect-race", {
+    timestamp: Date.now(),
+    accepted,
+    input: result.input,
+    winner: result.winner,
+    agreement: result.agreement,
+    total: result.total,
+    candidates: result.candidates,
+  });
+}
+
+function storePredictionRace(pi: ExtensionAPI, result: RaceResult, accepted?: boolean) {
+  pi.appendEntry("ollama-prediction-race", {
     timestamp: Date.now(),
     accepted,
     input: result.input,
@@ -209,9 +304,9 @@ async function predict(ctx: ExtensionContext, pi: ExtensionAPI, model = PREDICTI
   const timeout = setTimeout(() => controller.abort(), 30_000);
 
   try {
-    const continuation = await predictNext(original, model, controller.signal);
+    const continuation = await predictNextWithSpec(original, model, controller.signal);
     if (!continuation) {
-      ctx.ui.notify("Ollama returned no prediction.", "warning");
+      ctx.ui.notify("Model returned no prediction.", "warning");
       return;
     }
 
@@ -227,6 +322,40 @@ async function predict(ctx: ExtensionContext, pi: ExtensionAPI, model = PREDICTI
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     ctx.ui.notify(`Prediction failed: ${message}`, "error");
+  } finally {
+    clearTimeout(timeout);
+    ctx.ui.setStatus("ollama-autocorrect", undefined);
+  }
+}
+
+async function predictionRace(ctx: ExtensionContext, pi: ExtensionAPI, models = PREDICTION_RACE_MODELS) {
+  if (!ctx.hasUI) return;
+
+  const original = ctx.ui.getEditorText();
+  if (original.trim().length < PREDICTION_MIN_CHARS) {
+    ctx.ui.notify("Type a little more before racing predictions.", "info");
+    return;
+  }
+
+  ctx.ui.setStatus("ollama-autocorrect", ctx.ui.theme.fg("accent", `racing ${models.length} predictors…`));
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 60_000);
+
+  try {
+    const result = await racePrediction(original, models, controller.signal);
+    storePredictionRace(pi, result, Boolean(result.winner));
+
+    if (!result.winner) {
+      ctx.ui.notify("No predictor returned a continuation. Stored failures in session.", "warning");
+      return;
+    }
+
+    ctx.ui.setEditorText(appendContinuation(original, result.winner));
+    ctx.ui.notify(`Prediction race winner: ${result.agreement}/${result.total} agreement. Stored in session.`, "info");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    ctx.ui.notify(`Prediction race failed: ${message}`, "error");
   } finally {
     clearTimeout(timeout);
     ctx.ui.setStatus("ollama-autocorrect", undefined);
@@ -280,9 +409,19 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("predict", {
-    description: `Predict the next text with Ollama (${PREDICTION_MODEL} by default). Usage: /predict [model]`,
+    description: `Predict the next text. Usage: /predict [ollama-model|ollama:model|openrouter:model]`,
     handler: async (args, ctx) => {
       await predict(ctx, pi, args.trim() || PREDICTION_MODEL);
+    },
+  });
+
+  pi.registerCommand("predict-race", {
+    description: `Race prediction providers. Usage: /predict-race [ollama:model,openrouter:model,...]`,
+    handler: async (args, ctx) => {
+      const models = args.trim()
+        ? args.split(/[\s,]+/).map((m) => m.trim()).filter(Boolean)
+        : PREDICTION_RACE_MODELS;
+      await predictionRace(ctx, pi, models);
     },
   });
 
