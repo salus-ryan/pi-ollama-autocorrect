@@ -18,7 +18,7 @@ Local Ollama-powered autocorrect for the Pi textbox.
 - Pi coding agent
 - Ollama running locally on `127.0.0.1:11434`
 - default autocorrect/live fix model: `llama3.2:latest`
-- default prediction model: `qwen2.5-coder:1.5b`
+- default prediction model: `llama3.2:latest`
 
 Start Ollama:
 

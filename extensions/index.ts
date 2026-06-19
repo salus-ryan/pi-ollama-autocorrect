@@ -5,7 +5,7 @@ import {
   type KeybindingsManager,
 } from "@earendil-works/pi-coding-agent";
 import type { EditorTheme, TUI } from "@earendil-works/pi-tui";
-import { Key, matchesKey, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { CURSOR_MARKER, Key, matchesKey, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 
 const DEFAULT_MODEL = "llama3.2:latest";
 const OLLAMA_URL = "http://127.0.0.1:11434/api/generate";
@@ -17,7 +17,7 @@ const PREDICTION_MIN_CHARS = 16;
 // Live racing multiple models made the textbox feel broken on-device because
 // Ollama queues/contends the generations. Keep live ghost fast; race manually.
 const GHOST_MODEL = "llama3.2:latest";
-const PREDICTION_MODEL = "qwen2.5-coder:1.5b";
+const PREDICTION_MODEL = "llama3.2:latest";
 const FULL_RACE_MODELS = ["qwen2.5-coder:1.5b", "llama3.2:latest", "mistral:latest", "phi:latest"];
 
 type RaceCandidate = {
@@ -443,6 +443,27 @@ export default function (pi: ExtensionAPI) {
         if (lines.length < 2) return lines;
 
         const current = this.getText();
+        const cursor = this.getCursor();
+        const editorLines = this.getLines();
+        const lastLineIndex = editorLines.length - 1;
+        const cursorAtEnd = cursor.line === lastLineIndex && cursor.col === (editorLines[lastLineIndex]?.length ?? 0);
+        let renderedLines = lines;
+
+        if (this.predictionGhost && cursorAtEnd) {
+          const cursorLineIndex = lines.findIndex((line) => line.includes(CURSOR_MARKER));
+          if (cursorLineIndex >= 0) {
+            const cursorSpace = "\x1b[7m \x1b[0m";
+            const line = lines[cursorLineIndex]!;
+            const markerIndex = line.indexOf(CURSOR_MARKER);
+            const beforeMarker = line.slice(0, markerIndex);
+            const afterMarker = line.slice(markerIndex + CURSOR_MARKER.length);
+            const afterCursor = afterMarker.startsWith(cursorSpace) ? afterMarker.slice(cursorSpace.length) : afterMarker;
+            const inlineGhost = ctx.ui.theme.fg("dim", this.predictionGhost);
+            renderedLines = [...lines];
+            renderedLines[cursorLineIndex] = `${beforeMarker}${CURSOR_MARKER}${inlineGhost}${afterCursor}`;
+          }
+        }
+
         const ghostLines: string[] = [];
 
         if (this.correctionGhost && this.correctionGhost !== current) {
@@ -451,17 +472,13 @@ export default function (pi: ExtensionAPI) {
           );
         }
 
-        if (this.predictionGhost) {
-          ghostLines.push(
-            ...wrapTextWithAnsi(ctx.ui.theme.fg("dim", `↳ next: ${this.predictionGhost}${this.predictionMeta}`), width),
-          );
+        if (this.predictionGhost && !cursorAtEnd) {
+          ghostLines.push(...wrapTextWithAnsi(ctx.ui.theme.fg("dim", `↳ next: ${this.predictionGhost}`), width));
         }
 
-        if (!ghostLines.length) return lines;
+        if (!ghostLines.length) return renderedLines;
 
-        // True inline gray text behind the cursor is not exposed by pi's editor API yet,
-        // so render the live Ollama correction/prediction as dim wrapped lines above the bottom border.
-        return [...lines.slice(0, -1), ...ghostLines, lines[lines.length - 1]!];
+        return [...renderedLines.slice(0, -1), ...ghostLines, renderedLines[renderedLines.length - 1]!];
       }
     }
 
