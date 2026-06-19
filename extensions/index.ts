@@ -11,7 +11,7 @@ const DEFAULT_MODEL = "llama3.2:latest";
 const OLLAMA_URL = "http://127.0.0.1:11434/api/generate";
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 const OPENROUTER_DEFAULT_MODEL = "openai/gpt-4o-mini";
-const GHOST_DEBOUNCE_MS = 900;
+const GHOST_DEBOUNCE_MS = 500;
 const GHOST_MIN_CHARS = 8;
 const PREDICTION_MIN_CHARS = 16;
 
@@ -19,9 +19,9 @@ const PREDICTION_MIN_CHARS = 16;
 // generations, so racing autocorrect + prediction while typing can hide prediction.
 // Autocorrect remains available via Tab after manual command/shortcut and /autocorrect.
 const GHOST_MODEL = "llama3.2:latest";
-const PREDICTION_MODEL = "llama3.2:latest";
+const PREDICTION_MODEL = "qwen2.5:0.5b";
 const FULL_RACE_MODELS = ["qwen2.5-coder:1.5b", "llama3.2:latest", "mistral:latest", "phi:latest"];
-const PREDICTION_RACE_MODELS = ["ollama:llama3.2:latest", `openrouter:${OPENROUTER_DEFAULT_MODEL}`];
+const PREDICTION_RACE_MODELS = ["ollama:qwen2.5:0.5b", "ollama:llama3.2:latest", `openrouter:${OPENROUTER_DEFAULT_MODEL}`];
 const TELEMETRY_TYPE = "ai-native-typing-telemetry";
 
 type RaceCandidate = {
@@ -232,7 +232,7 @@ async function predictNext(original: string, model = PREDICTION_MODEL, signal?: 
       ].join("\n"),
       options: {
         temperature: 0.2,
-        num_predict: 48,
+        num_predict: 24,
       },
     }),
   });

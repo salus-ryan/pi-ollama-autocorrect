@@ -23,7 +23,7 @@ Local Ollama-powered autocorrect/prediction for the Pi textbox, with optional Op
 - Pi coding agent
 - Ollama running locally on `127.0.0.1:11434`
 - default autocorrect/live fix model: `llama3.2:latest`
-- default live prediction model: `llama3.2:latest`
+- default live prediction model: `qwen2.5:0.5b`
 - optional OpenRouter API key in `OPENROUTER_API_KEY`
 
 Start Ollama:
@@ -32,10 +32,11 @@ Start Ollama:
 ollama serve
 ```
 
-Pull the default model if needed:
+Pull the default models if needed:
 
 ```bash
 ollama pull llama3.2
+ollama pull qwen2.5:0.5b
 ```
 
 For OpenRouter prediction races/pricing:
@@ -47,7 +48,7 @@ export OPENROUTER_API_KEY=your_key_here
 Cost-aware race example:
 
 ```text
-/predict-race ollama:llama3.2:latest,openrouter:auto
+/predict-race ollama:qwen2.5:0.5b,ollama:llama3.2:latest,openrouter:auto
 ```
 
 ## Install locally
