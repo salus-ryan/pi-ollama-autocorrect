@@ -14,6 +14,8 @@ Local Ollama-powered autocorrect/prediction for the Pi textbox, with optional Op
 - `/predict openrouter:openai/gpt-4o-mini` uses OpenRouter for one prediction
 - `/predict-race [ollama:model,openrouter:model,openrouter:auto,...]` races local/API predictors and stores results
 - `/openrouter-models [limit]` fetches OpenRouter pricing and stores a cost/value ranking
+- local AI-native typing telemetry: shown, accepted, typed-past, cleared, latency, cost estimates
+- `/typing-telemetry-stats`, `/typing-telemetry-export`, `/typing-telemetry-clear`
 - `/autocorrect-race [model1,model2,...]` stores model agreement data in the Pi session
 
 ## Requirements
@@ -66,6 +68,28 @@ Then reload Pi:
 
 ```text
 /reload
+```
+
+## Telemetry / training data
+
+The extension appends structured local session events for future evaluation/fine-tuning:
+
+- suggestion requested/shown
+- accepted via `Tab` or `Ctrl+Space`
+- typed-past / cleared suggestions
+- latency, model/provider, rough token estimates
+- prediction/autocorrect race results
+
+Export current in-memory events to a JSONL session entry:
+
+```text
+/typing-telemetry-export
+```
+
+Telemetry is redacted by default for common API keys/tokens. To keep raw text for a controlled local experiment:
+
+```bash
+export PI_AUTOCORRECT_RAW_TELEMETRY=1
 ```
 
 ## Notes

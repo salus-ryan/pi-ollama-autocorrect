@@ -22,6 +22,7 @@ const GHOST_MODEL = "llama3.2:latest";
 const PREDICTION_MODEL = "llama3.2:latest";
 const FULL_RACE_MODELS = ["qwen2.5-coder:1.5b", "llama3.2:latest", "mistral:latest", "phi:latest"];
 const PREDICTION_RACE_MODELS = ["ollama:llama3.2:latest", `openrouter:${OPENROUTER_DEFAULT_MODEL}`];
+const TELEMETRY_TYPE = "ai-native-typing-telemetry";
 
 type RaceCandidate = {
   model: string;
@@ -56,12 +57,76 @@ type PricedOpenRouterModel = OpenRouterModel & {
   valueScore: number;
 };
 
+type TelemetryEvent = {
+  id: string;
+  timestamp: number;
+  event:
+    | "suggestion_requested"
+    | "suggestion_shown"
+    | "suggestion_replaced"
+    | "suggestion_cleared"
+    | "suggestion_accepted"
+    | "typed_past"
+    | "manual_prediction"
+    | "manual_autocorrect"
+    | "race_completed";
+  kind: "prediction" | "correction" | "race";
+  model?: string;
+  provider?: "ollama" | "openrouter" | "mixed";
+  input?: string;
+  suggestion?: string;
+  accepted?: boolean;
+  acceptKey?: string;
+  latencyMs?: number;
+  reason?: string;
+  inputChars?: number;
+  suggestionChars?: number;
+  estimatedInputTokens?: number;
+  estimatedOutputTokens?: number;
+  estimatedCostUsd?: number;
+  metadata?: Record<string, unknown>;
+};
+
+const telemetryBuffer: TelemetryEvent[] = [];
+let telemetryCounter = 0;
+
 function normalizeForAgreement(text: string): string {
   return text.trim().replace(/\s+/g, " ").toLowerCase();
 }
 
 function getEnv(name: string): string | undefined {
   return (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env?.[name];
+}
+
+function shouldRedactTelemetry(): boolean {
+  return getEnv("PI_AUTOCORRECT_RAW_TELEMETRY") !== "1";
+}
+
+function redactText(text?: string): string | undefined {
+  if (text === undefined || !shouldRedactTelemetry()) return text;
+  return text
+    .replace(/(OPENROUTER_API_KEY|API_KEY|TOKEN|SECRET|PASSWORD|PASS)\s*=\s*\S+/gi, "$1=<redacted>")
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer <redacted>")
+    .replace(/sk-[A-Za-z0-9_-]{12,}/g, "sk-<redacted>")
+    .replace(/gh[oprsu]_[A-Za-z0-9_]{20,}/g, "gh_<redacted>");
+}
+
+function appendTelemetry(pi: ExtensionAPI, event: Omit<TelemetryEvent, "id" | "timestamp">): TelemetryEvent {
+  const entry: TelemetryEvent = {
+    ...event,
+    id: `typing-${Date.now()}-${++telemetryCounter}`,
+    timestamp: Date.now(),
+    input: redactText(event.input),
+    suggestion: redactText(event.suggestion),
+    inputChars: event.input?.length,
+    suggestionChars: event.suggestion?.length,
+    estimatedInputTokens: event.input ? estimateTokens(event.input) : undefined,
+    estimatedOutputTokens: event.suggestion ? estimateTokens(event.suggestion) : undefined,
+  };
+  telemetryBuffer.push(entry);
+  if (telemetryBuffer.length > 1000) telemetryBuffer.shift();
+  pi.appendEntry(TELEMETRY_TYPE, entry);
+  return entry;
 }
 
 function cleanContinuation(original: string, raw: string): string {
@@ -336,6 +401,16 @@ async function autocorrect(ctx: ExtensionContext, pi: ExtensionAPI, model = DEFA
     }
 
     ctx.ui.setEditorText(corrected);
+    appendTelemetry(pi, {
+      event: "manual_autocorrect",
+      kind: "correction",
+      model,
+      provider: "ollama",
+      input: original,
+      suggestion: corrected,
+      accepted: true,
+      acceptKey: "command",
+    });
     pi.appendEntry("ollama-autocorrect-single", {
       timestamp: Date.now(),
       model,
@@ -375,6 +450,16 @@ async function predict(ctx: ExtensionContext, pi: ExtensionAPI, model = PREDICTI
     }
 
     ctx.ui.setEditorText(appendContinuation(original, continuation));
+    appendTelemetry(pi, {
+      event: "manual_prediction",
+      kind: "prediction",
+      model,
+      provider: model.startsWith("openrouter:") ? "openrouter" : "ollama",
+      input: original,
+      suggestion: continuation,
+      accepted: true,
+      acceptKey: "command",
+    });
     pi.appendEntry("ollama-autocorrect-predict", {
       timestamp: Date.now(),
       model,
@@ -450,6 +535,15 @@ async function predictionRace(ctx: ExtensionContext, pi: ExtensionAPI, models = 
         ]
       : models;
     const result = await racePrediction(original, raceModels, controller.signal);
+    appendTelemetry(pi, {
+      event: "race_completed",
+      kind: "race",
+      provider: "mixed",
+      input: original,
+      suggestion: result.winner,
+      accepted: Boolean(result.winner),
+      metadata: { race: "prediction", agreement: result.agreement, total: result.total, candidates: result.candidates },
+    });
     storePredictionRace(pi, result, Boolean(result.winner));
 
     if (!result.winner) {
@@ -465,6 +559,37 @@ async function predictionRace(ctx: ExtensionContext, pi: ExtensionAPI, models = 
   } finally {
     clearTimeout(timeout);
     ctx.ui.setStatus("ollama-autocorrect", undefined);
+  }
+}
+
+function exportTelemetry(ctx: ExtensionContext, pi: ExtensionAPI) {
+  const jsonl = telemetryBuffer.map((event) => JSON.stringify(event)).join("\n");
+  pi.appendEntry("ai-native-training-jsonl-export", {
+    timestamp: Date.now(),
+    count: telemetryBuffer.length,
+    redacted: shouldRedactTelemetry(),
+    jsonl,
+  });
+  if (ctx.hasUI) {
+    ctx.ui.notify(`Exported ${telemetryBuffer.length} telemetry events to session as JSONL.`, "info");
+  }
+}
+
+function telemetryStats(ctx: ExtensionContext, pi: ExtensionAPI) {
+  const accepted = telemetryBuffer.filter((event) => event.accepted).length;
+  const shown = telemetryBuffer.filter((event) => event.event === "suggestion_shown").length;
+  const typedPast = telemetryBuffer.filter((event) => event.event === "typed_past").length;
+  const latencyEvents = telemetryBuffer.filter((event) => typeof event.latencyMs === "number");
+  const averageLatency = latencyEvents.length
+    ? latencyEvents.reduce((sum, event) => sum + (event.latencyMs ?? 0), 0) / latencyEvents.length
+    : 0;
+  const stats = { timestamp: Date.now(), total: telemetryBuffer.length, shown, accepted, typedPast, averageLatency };
+  pi.appendEntry("ai-native-telemetry-stats", stats);
+  if (ctx.hasUI) {
+    ctx.ui.notify(
+      `Telemetry: ${stats.total} events, ${accepted} accepted, ${typedPast} typed-past, avg ${Math.round(averageLatency)}ms.`,
+      "info",
+    );
   }
 }
 
@@ -484,6 +609,15 @@ async function autocorrectRace(ctx: ExtensionContext, pi: ExtensionAPI, models =
 
   try {
     const result = await raceAutocorrect(original, models, controller.signal);
+    appendTelemetry(pi, {
+      event: "race_completed",
+      kind: "race",
+      provider: "ollama",
+      input: original,
+      suggestion: result.winner,
+      accepted: true,
+      metadata: { race: "autocorrect", agreement: result.agreement, total: result.total, candidates: result.candidates },
+    });
     ctx.ui.setEditorText(result.winner);
     storeRace(pi, result, true);
     ctx.ui.notify(`Race winner: ${result.agreement}/${result.total} agreement. Stored in session.`, "info");
@@ -539,6 +673,29 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("typing-telemetry-export", {
+    description: "Export current typing telemetry buffer to a redacted JSONL session entry.",
+    handler: async (_args, ctx) => {
+      exportTelemetry(ctx, pi);
+    },
+  });
+
+  pi.registerCommand("typing-telemetry-stats", {
+    description: "Summarize current typing telemetry accept/reject/latency stats.",
+    handler: async (_args, ctx) => {
+      telemetryStats(ctx, pi);
+    },
+  });
+
+  pi.registerCommand("typing-telemetry-clear", {
+    description: "Clear the in-memory typing telemetry buffer for this session.",
+    handler: async (_args, ctx) => {
+      telemetryBuffer.length = 0;
+      pi.appendEntry("ai-native-telemetry-cleared", { timestamp: Date.now() });
+      if (ctx.hasUI) ctx.ui.notify("Cleared in-memory typing telemetry buffer.", "info");
+    },
+  });
+
   pi.registerShortcut("ctrl+shift+a", {
     description: `Accept/autocorrect editor text with Ollama (${DEFAULT_MODEL})`,
     handler: async (ctx) => {
@@ -561,6 +718,8 @@ export default function (pi: ExtensionAPI) {
       private correctionMeta = "";
       private predictionGhost = "";
       private predictionMeta = "";
+      private predictionInput = "";
+      private predictionShownAt = 0;
       private lastRace?: RaceResult;
       private lastRequested = "";
       private debounceTimer?: ReturnType<typeof setTimeout>;
@@ -571,12 +730,27 @@ export default function (pi: ExtensionAPI) {
         super(tui, theme, keybindings);
       }
 
-      private clearGhost(): void {
+      private clearGhost(reason = "cleared"): void {
+        if (reason !== "accepted" && this.predictionGhost && this.predictionGhost !== "…" && this.predictionGhost !== "prediction unavailable") {
+          appendTelemetry(pi, {
+            event: "suggestion_cleared",
+            kind: "prediction",
+            model: PREDICTION_MODEL,
+            provider: "ollama",
+            input: this.predictionInput,
+            suggestion: this.predictionGhost,
+            accepted: false,
+            reason,
+          });
+        }
+
         if (this.correctionGhost || this.correctionMeta || this.predictionGhost || this.predictionMeta) {
           this.correctionGhost = "";
           this.correctionMeta = "";
           this.predictionGhost = "";
           this.predictionMeta = "";
+          this.predictionInput = "";
+          this.predictionShownAt = 0;
           this.lastRace = undefined;
           this.tui.requestRender();
         }
@@ -587,6 +761,23 @@ export default function (pi: ExtensionAPI) {
         this.abort?.abort();
 
         const text = this.getText();
+        if (this.predictionGhost && this.predictionGhost !== "…" && text !== this.predictionInput) {
+          appendTelemetry(pi, {
+            event: "typed_past",
+            kind: "prediction",
+            model: PREDICTION_MODEL,
+            provider: "ollama",
+            input: this.predictionInput,
+            suggestion: this.predictionGhost,
+            accepted: false,
+            reason: "user_typed_before_accepting",
+            metadata: { textAfter: redactText(text), visibleMs: Date.now() - this.predictionShownAt },
+          });
+          this.predictionGhost = "";
+          this.predictionMeta = "";
+          this.predictionInput = "";
+          this.predictionShownAt = 0;
+        }
         if (text.trim().length < GHOST_MIN_CHARS || text.trim().startsWith("/")) {
           this.clearGhost();
           return;
@@ -610,6 +801,14 @@ export default function (pi: ExtensionAPI) {
         this.correctionMeta = "";
         this.predictionGhost = "…";
         this.predictionMeta = ` ${PREDICTION_MODEL}`;
+        this.predictionInput = text;
+        appendTelemetry(pi, {
+          event: "suggestion_requested",
+          kind: "prediction",
+          model: PREDICTION_MODEL,
+          provider: "ollama",
+          input: text,
+        });
         this.tui.requestRender();
 
         try {
@@ -620,11 +819,26 @@ export default function (pi: ExtensionAPI) {
           if (id !== this.requestId || controller.signal.aborted) return;
 
           if (prediction) {
+            const latencyMs = Date.now() - predictionStart;
             this.predictionGhost = prediction;
-            this.predictionMeta = ` ${PREDICTION_MODEL} ${Date.now() - predictionStart}ms`;
+            this.predictionMeta = ` ${PREDICTION_MODEL} ${latencyMs}ms`;
+            this.predictionInput = text;
+            this.predictionShownAt = Date.now();
+            appendTelemetry(pi, {
+              event: "suggestion_shown",
+              kind: "prediction",
+              model: PREDICTION_MODEL,
+              provider: "ollama",
+              input: text,
+              suggestion: prediction,
+              accepted: false,
+              latencyMs,
+            });
           } else {
             this.predictionGhost = "";
             this.predictionMeta = "";
+            this.predictionInput = "";
+            this.predictionShownAt = 0;
           }
         } catch (error) {
           if (id !== this.requestId) return;
@@ -639,24 +853,54 @@ export default function (pi: ExtensionAPI) {
       handleInput(data: string): void {
         if (matchesKey(data, Key.tab) && this.correctionGhost && !this.isShowingAutocomplete()) {
           const accepted = this.lastRace;
-          this.setText(this.correctionGhost);
-          this.clearGhost();
+          const input = this.getText();
+          const suggestion = this.correctionGhost;
+          this.setText(suggestion);
+          appendTelemetry(pi, {
+            event: "suggestion_accepted",
+            kind: "correction",
+            model: GHOST_MODEL,
+            provider: "ollama",
+            input,
+            suggestion,
+            accepted: true,
+            acceptKey: "tab",
+          });
+          this.clearGhost("accepted");
           if (accepted) storeRace(pi, accepted, true);
           this.scheduleGhost();
           return;
         }
 
-        if (matchesKey(data, Key.ctrl("space")) && this.predictionGhost && !this.isShowingAutocomplete()) {
+        if (
+          matchesKey(data, Key.ctrl("space"))
+          && this.predictionGhost
+          && this.predictionGhost !== "…"
+          && this.predictionGhost !== "prediction unavailable"
+          && !this.isShowingAutocomplete()
+        ) {
           const input = this.getText();
-          this.setText(appendContinuation(input, this.predictionGhost));
+          const suggestion = this.predictionGhost;
+          this.setText(appendContinuation(input, suggestion));
+          appendTelemetry(pi, {
+            event: "suggestion_accepted",
+            kind: "prediction",
+            model: PREDICTION_MODEL,
+            provider: "ollama",
+            input,
+            suggestion,
+            accepted: true,
+            acceptKey: "ctrl+space",
+            metadata: { visibleMs: Date.now() - this.predictionShownAt },
+          });
           pi.appendEntry("ollama-autocorrect-predict", {
             timestamp: Date.now(),
             model: PREDICTION_MODEL,
             input,
-            output: this.predictionGhost,
+            output: suggestion,
             accepted: true,
           });
-          this.clearGhost();
+          this.clearGhost("accepted");
           this.scheduleGhost();
           return;
         }
