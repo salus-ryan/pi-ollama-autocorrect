@@ -5,16 +5,20 @@ Local Ollama-powered autocorrect for the Pi textbox.
 ## Features
 
 - dim gray ghost correction while you type
-- `Tab` accepts the ghost suggestion
+- second ghost line predicts what you may type next
+- `Tab` accepts the autocorrect ghost
+- `Ctrl+Space` accepts the prediction ghost
 - `Ctrl+Shift+A` runs/apply autocorrect manually
 - `/autocorrect [model]`
+- `/predict [model]`
 - `/autocorrect-race [model1,model2,...]` stores model agreement data in the Pi session
 
 ## Requirements
 
 - Pi coding agent
 - Ollama running locally on `127.0.0.1:11434`
-- default live model: `llama3.2:latest`
+- default autocorrect/live fix model: `llama3.2:latest`
+- default prediction model: `qwen2.5-coder:1.5b`
 
 Start Ollama:
 

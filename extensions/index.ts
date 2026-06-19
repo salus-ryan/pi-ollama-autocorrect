@@ -11,11 +11,13 @@ const DEFAULT_MODEL = "llama3.2:latest";
 const OLLAMA_URL = "http://127.0.0.1:11434/api/generate";
 const GHOST_DEBOUNCE_MS = 900;
 const GHOST_MIN_CHARS = 8;
+const PREDICTION_MIN_CHARS = 16;
 
 // Fast enough for live ghost text. /autocorrect-race uses the longer list below.
 // Live racing multiple models made the textbox feel broken on-device because
 // Ollama queues/contends the generations. Keep live ghost fast; race manually.
 const GHOST_MODEL = "llama3.2:latest";
+const PREDICTION_MODEL = "qwen2.5-coder:1.5b";
 const FULL_RACE_MODELS = ["qwen2.5-coder:1.5b", "llama3.2:latest", "mistral:latest", "phi:latest"];
 
 type RaceCandidate = {
@@ -57,6 +59,39 @@ async function askOllama(original: string, model = DEFAULT_MODEL, signal?: Abort
       options: {
         temperature: 0,
         num_predict: Math.max(128, Math.ceil(original.length * 1.5)),
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Ollama HTTP ${response.status}: ${await response.text()}`);
+  }
+
+  const data = (await response.json()) as { response?: string };
+  return data.response?.trim() ?? "";
+}
+
+async function predictNext(original: string, model = PREDICTION_MODEL, signal?: AbortSignal): Promise<string> {
+  const response = await fetch(OLLAMA_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    signal,
+    body: JSON.stringify({
+      model,
+      stream: false,
+      prompt: [
+        "You are a typing continuation engine for a coding-agent input textbox.",
+        "Predict only the next short phrase or sentence the user is likely to type.",
+        "Preserve the user's tone and context. Do not answer the user. Do not explain.",
+        "Return only the continuation text, not the original text.",
+        "If no useful continuation is obvious, return an empty string.",
+        "",
+        "Text so far:",
+        original,
+      ].join("\n"),
+      options: {
+        temperature: 0.2,
+        num_predict: 48,
       },
     }),
   });
@@ -112,6 +147,12 @@ function storeRace(pi: ExtensionAPI, result: RaceResult, accepted?: boolean) {
   });
 }
 
+function appendContinuation(text: string, continuation: string): string {
+  if (!continuation) return text;
+  if (!text || /\s$/.test(text) || /^\s|^[.,!?;:)]/.test(continuation)) return text + continuation;
+  return `${text} ${continuation}`;
+}
+
 async function autocorrect(ctx: ExtensionContext, pi: ExtensionAPI, model = DEFAULT_MODEL) {
   if (!ctx.hasUI) return;
 
@@ -145,6 +186,45 @@ async function autocorrect(ctx: ExtensionContext, pi: ExtensionAPI, model = DEFA
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     ctx.ui.notify(`Autocorrect failed: ${message}`, "error");
+  } finally {
+    clearTimeout(timeout);
+    ctx.ui.setStatus("ollama-autocorrect", undefined);
+  }
+}
+
+async function predict(ctx: ExtensionContext, pi: ExtensionAPI, model = PREDICTION_MODEL) {
+  if (!ctx.hasUI) return;
+
+  const original = ctx.ui.getEditorText();
+  if (original.trim().length < PREDICTION_MIN_CHARS) {
+    ctx.ui.notify("Type a little more before predicting.", "info");
+    return;
+  }
+
+  ctx.ui.setStatus("ollama-autocorrect", ctx.ui.theme.fg("accent", "predicting next words…"));
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30_000);
+
+  try {
+    const continuation = await predictNext(original, model, controller.signal);
+    if (!continuation) {
+      ctx.ui.notify("Ollama returned no prediction.", "warning");
+      return;
+    }
+
+    ctx.ui.setEditorText(appendContinuation(original, continuation));
+    pi.appendEntry("ollama-autocorrect-predict", {
+      timestamp: Date.now(),
+      model,
+      input: original,
+      output: continuation,
+      accepted: true,
+    });
+    ctx.ui.notify(`Predicted next text with ${model}.`, "info");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    ctx.ui.notify(`Prediction failed: ${message}`, "error");
   } finally {
     clearTimeout(timeout);
     ctx.ui.setStatus("ollama-autocorrect", undefined);
@@ -197,6 +277,13 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("predict", {
+    description: `Predict the next text with Ollama (${PREDICTION_MODEL} by default). Usage: /predict [model]`,
+    handler: async (args, ctx) => {
+      await predict(ctx, pi, args.trim() || PREDICTION_MODEL);
+    },
+  });
+
   pi.registerShortcut("ctrl+shift+a", {
     description: `Accept/autocorrect editor text with Ollama (${DEFAULT_MODEL})`,
     handler: async (ctx) => {
@@ -204,12 +291,21 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerShortcut("ctrl+space", {
+    description: `Predict and append next text with Ollama (${PREDICTION_MODEL})`,
+    handler: async (ctx) => {
+      await predict(ctx, pi, PREDICTION_MODEL);
+    },
+  });
+
   pi.on("session_start", (_event, ctx) => {
     if (!ctx.hasUI || ctx.mode !== "tui") return;
 
     class OllamaGhostEditor extends CustomEditor {
-      private ghost = "";
-      private ghostMeta = "";
+      private correctionGhost = "";
+      private correctionMeta = "";
+      private predictionGhost = "";
+      private predictionMeta = "";
       private lastRace?: RaceResult;
       private lastRequested = "";
       private debounceTimer?: ReturnType<typeof setTimeout>;
@@ -221,9 +317,11 @@ export default function (pi: ExtensionAPI) {
       }
 
       private clearGhost(): void {
-        if (this.ghost || this.ghostMeta) {
-          this.ghost = "";
-          this.ghostMeta = "";
+        if (this.correctionGhost || this.correctionMeta || this.predictionGhost || this.predictionMeta) {
+          this.correctionGhost = "";
+          this.correctionMeta = "";
+          this.predictionGhost = "";
+          this.predictionMeta = "";
           this.lastRace = undefined;
           this.tui.requestRender();
         }
@@ -252,13 +350,21 @@ export default function (pi: ExtensionAPI) {
         const id = ++this.requestId;
         const controller = new AbortController();
         this.abort = controller;
-        const start = Date.now();
+        const correctionStart = Date.now();
+        const predictionStart = Date.now();
 
-        try {
-          const corrected = await askOllama(text, GHOST_MODEL, controller.signal);
-          if (id !== this.requestId || controller.signal.aborted) return;
+        const [correction, prediction] = await Promise.allSettled([
+          askOllama(text, GHOST_MODEL, controller.signal),
+          trimmed.length >= PREDICTION_MIN_CHARS
+            ? predictNext(text, PREDICTION_MODEL, controller.signal)
+            : Promise.resolve(""),
+        ]);
 
-          const candidate: RaceCandidate = { model: GHOST_MODEL, text: corrected, ms: Date.now() - start };
+        if (id !== this.requestId || controller.signal.aborted) return;
+
+        if (correction.status === "fulfilled") {
+          const corrected = correction.value;
+          const candidate: RaceCandidate = { model: GHOST_MODEL, text: corrected, ms: Date.now() - correctionStart };
           const result: RaceResult = {
             input: text,
             winner: corrected || text,
@@ -270,24 +376,49 @@ export default function (pi: ExtensionAPI) {
           storeRace(pi, result, false);
 
           if (corrected && corrected !== text) {
-            this.ghost = corrected;
-            this.ghostMeta = ` ${GHOST_MODEL} ${candidate.ms}ms`;
+            this.correctionGhost = corrected;
+            this.correctionMeta = ` ${GHOST_MODEL} ${candidate.ms}ms`;
           } else {
-            this.ghost = "";
-            this.ghostMeta = "";
+            this.correctionGhost = "";
+            this.correctionMeta = "";
           }
-          this.tui.requestRender();
-        } catch {
-          if (id === this.requestId) this.clearGhost();
+        } else {
+          this.correctionGhost = "";
+          this.correctionMeta = "";
         }
+
+        if (prediction.status === "fulfilled" && prediction.value) {
+          this.predictionGhost = prediction.value;
+          this.predictionMeta = ` ${PREDICTION_MODEL} ${Date.now() - predictionStart}ms`;
+        } else {
+          this.predictionGhost = "";
+          this.predictionMeta = "";
+        }
+
+        this.tui.requestRender();
       }
 
       handleInput(data: string): void {
-        if (matchesKey(data, Key.tab) && this.ghost && !this.isShowingAutocomplete()) {
+        if (matchesKey(data, Key.tab) && this.correctionGhost && !this.isShowingAutocomplete()) {
           const accepted = this.lastRace;
-          this.setText(this.ghost);
+          this.setText(this.correctionGhost);
           this.clearGhost();
           if (accepted) storeRace(pi, accepted, true);
+          this.scheduleGhost();
+          return;
+        }
+
+        if (matchesKey(data, Key.ctrl("space")) && this.predictionGhost && !this.isShowingAutocomplete()) {
+          const input = this.getText();
+          this.setText(appendContinuation(input, this.predictionGhost));
+          pi.appendEntry("ollama-autocorrect-predict", {
+            timestamp: Date.now(),
+            model: PREDICTION_MODEL,
+            input,
+            output: this.predictionGhost,
+            accepted: true,
+          });
+          this.clearGhost();
           this.scheduleGhost();
           return;
         }
@@ -300,21 +431,32 @@ export default function (pi: ExtensionAPI) {
 
       render(width: number): string[] {
         const lines = super.render(width);
-        if (!this.ghost || lines.length < 2) return lines;
+        if (lines.length < 2) return lines;
 
         const current = this.getText();
-        if (this.ghost === current) return lines;
+        const ghostLines: string[] = [];
 
-        const ghostText = `↳ ${this.ghost}${this.ghostMeta}`;
-        const ghostLines = wrapTextWithAnsi(ctx.ui.theme.fg("dim", ghostText), width);
+        if (this.correctionGhost && this.correctionGhost !== current) {
+          ghostLines.push(
+            ...wrapTextWithAnsi(ctx.ui.theme.fg("dim", `↳ fix: ${this.correctionGhost}${this.correctionMeta}`), width),
+          );
+        }
+
+        if (this.predictionGhost) {
+          ghostLines.push(
+            ...wrapTextWithAnsi(ctx.ui.theme.fg("dim", `↳ next: ${this.predictionGhost}${this.predictionMeta}`), width),
+          );
+        }
+
+        if (!ghostLines.length) return lines;
 
         // True inline gray text behind the cursor is not exposed by pi's editor API yet,
-        // so render the live Ollama correction as dim wrapped lines above the bottom border.
+        // so render the live Ollama correction/prediction as dim wrapped lines above the bottom border.
         return [...lines.slice(0, -1), ...ghostLines, lines[lines.length - 1]!];
       }
     }
 
     ctx.ui.setEditorComponent((tui, theme, keybindings) => new OllamaGhostEditor(tui, theme, keybindings));
-    ctx.ui.notify("Ollama autocorrect loaded: fast ghost + /autocorrect-race for horse race", "info");
+    ctx.ui.notify("Ollama autocorrect loaded: Tab accepts fix, Ctrl+Space accepts prediction", "info");
   });
 }
