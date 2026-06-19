@@ -38,6 +38,24 @@ type RaceResult = {
   candidates: RaceCandidate[];
 };
 
+type OpenRouterModel = {
+  id: string;
+  name?: string;
+  context_length?: number;
+  pricing?: {
+    prompt?: string;
+    completion?: string;
+  };
+};
+
+type PricedOpenRouterModel = OpenRouterModel & {
+  promptCostPerMillion: number;
+  completionCostPerMillion: number;
+  estimatedCostPerCall: number;
+  complexityScore: number;
+  valueScore: number;
+};
+
 function normalizeForAgreement(text: string): string {
   return text.trim().replace(/\s+/g, " ").toLowerCase();
 }
@@ -49,6 +67,52 @@ function getEnv(name: string): string | undefined {
 function cleanContinuation(original: string, raw: string): string {
   const withoutQuotes = raw.trim().replace(/^['"“”]+|['"“”]+$/g, "");
   return withoutQuotes.startsWith(original) ? withoutQuotes.slice(original.length).trim() : withoutQuotes;
+}
+
+function parsePricePerToken(value?: string): number {
+  const parsed = Number.parseFloat(value ?? "0");
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function estimateTokens(text: string): number {
+  return Math.max(1, Math.ceil(text.length / 4));
+}
+
+async function fetchOpenRouterModels(signal?: AbortSignal): Promise<OpenRouterModel[]> {
+  const response = await fetch("https://openrouter.ai/api/v1/models", { signal });
+  if (!response.ok) throw new Error(`OpenRouter models HTTP ${response.status}: ${await response.text()}`);
+  const data = (await response.json()) as { data?: OpenRouterModel[] };
+  return data.data ?? [];
+}
+
+function priceOpenRouterModels(
+  models: OpenRouterModel[],
+  inputTokens = 256,
+  outputTokens = 48,
+): PricedOpenRouterModel[] {
+  return models.map((model) => {
+    const promptPerToken = parsePricePerToken(model.pricing?.prompt);
+    const completionPerToken = parsePricePerToken(model.pricing?.completion);
+    const estimatedCostPerCall = promptPerToken * inputTokens + completionPerToken * outputTokens;
+    const promptCostPerMillion = promptPerToken * 1_000_000;
+    const completionCostPerMillion = completionPerToken * 1_000_000;
+    const complexityScore = Math.log10(Math.max(10, model.context_length ?? 10));
+    const valueScore = complexityScore / Math.max(0.000001, estimatedCostPerCall || 0.000001);
+    return { ...model, promptCostPerMillion, completionCostPerMillion, estimatedCostPerCall, complexityScore, valueScore };
+  });
+}
+
+async function chooseOpenRouterModelsForBudget(
+  input: string,
+  maxModels = 4,
+  maxEstimatedCost = 0.001,
+  signal?: AbortSignal,
+): Promise<PricedOpenRouterModel[]> {
+  const priced = priceOpenRouterModels(await fetchOpenRouterModels(signal), estimateTokens(input), 48);
+  return priced
+    .filter((model) => model.estimatedCostPerCall <= maxEstimatedCost)
+    .sort((a, b) => b.valueScore - a.valueScore)
+    .slice(0, maxModels);
 }
 
 async function askOllama(original: string, model = DEFAULT_MODEL, signal?: AbortSignal): Promise<string> {
@@ -328,6 +392,40 @@ async function predict(ctx: ExtensionContext, pi: ExtensionAPI, model = PREDICTI
   }
 }
 
+async function listOpenRouterModels(ctx: ExtensionContext, pi: ExtensionAPI, limit = 12) {
+  if (!ctx.hasUI) return;
+
+  ctx.ui.setStatus("ollama-autocorrect", ctx.ui.theme.fg("accent", "fetching OpenRouter prices…"));
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30_000);
+
+  try {
+    const original = ctx.ui.getEditorText();
+    const priced = priceOpenRouterModels(await fetchOpenRouterModels(controller.signal), estimateTokens(original || "sample"), 48)
+      .sort((a, b) => b.valueScore - a.valueScore)
+      .slice(0, limit);
+
+    pi.appendEntry("openrouter-model-prices", {
+      timestamp: Date.now(),
+      inputTokens: estimateTokens(original || "sample"),
+      outputTokens: 48,
+      models: priced,
+    });
+
+    const summary = priced
+      .slice(0, Math.min(5, priced.length))
+      .map((model) => `${model.id} ~$${model.estimatedCostPerCall.toExponential(2)}/call`)
+      .join("; ");
+    ctx.ui.notify(`Best OpenRouter value models stored. Top: ${summary}`, "info");
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    ctx.ui.notify(`OpenRouter pricing failed: ${message}`, "error");
+  } finally {
+    clearTimeout(timeout);
+    ctx.ui.setStatus("ollama-autocorrect", undefined);
+  }
+}
+
 async function predictionRace(ctx: ExtensionContext, pi: ExtensionAPI, models = PREDICTION_RACE_MODELS) {
   if (!ctx.hasUI) return;
 
@@ -343,7 +441,15 @@ async function predictionRace(ctx: ExtensionContext, pi: ExtensionAPI, models = 
   const timeout = setTimeout(() => controller.abort(), 60_000);
 
   try {
-    const result = await racePrediction(original, models, controller.signal);
+    const raceModels = models.includes("openrouter:auto")
+      ? [
+          ...models.filter((model) => model !== "openrouter:auto"),
+          ...(await chooseOpenRouterModelsForBudget(original, 3, 0.001, controller.signal)).map(
+            (model) => `openrouter:${model.id}`,
+          ),
+        ]
+      : models;
+    const result = await racePrediction(original, raceModels, controller.signal);
     storePredictionRace(pi, result, Boolean(result.winner));
 
     if (!result.winner) {
@@ -416,12 +522,20 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("predict-race", {
-    description: `Race prediction providers. Usage: /predict-race [ollama:model,openrouter:model,...]`,
+    description: `Race prediction providers. Usage: /predict-race [ollama:model,openrouter:model,openrouter:auto,...]`,
     handler: async (args, ctx) => {
       const models = args.trim()
         ? args.split(/[\s,]+/).map((m) => m.trim()).filter(Boolean)
         : PREDICTION_RACE_MODELS;
       await predictionRace(ctx, pi, models);
+    },
+  });
+
+  pi.registerCommand("openrouter-models", {
+    description: "Fetch OpenRouter model prices and store cost/value ranking. Usage: /openrouter-models [limit]",
+    handler: async (args, ctx) => {
+      const limit = Number.parseInt(args.trim(), 10);
+      await listOpenRouterModels(ctx, pi, Number.isFinite(limit) ? limit : 12);
     },
   });
 

@@ -12,7 +12,8 @@ Local Ollama-powered autocorrect/prediction for the Pi textbox, with optional Op
 - `/autocorrect [model]`
 - `/predict [model]`
 - `/predict openrouter:openai/gpt-4o-mini` uses OpenRouter for one prediction
-- `/predict-race [ollama:model,openrouter:model,...]` races local/API predictors and stores results
+- `/predict-race [ollama:model,openrouter:model,openrouter:auto,...]` races local/API predictors and stores results
+- `/openrouter-models [limit]` fetches OpenRouter pricing and stores a cost/value ranking
 - `/autocorrect-race [model1,model2,...]` stores model agreement data in the Pi session
 
 ## Requirements
@@ -35,10 +36,16 @@ Pull the default model if needed:
 ollama pull llama3.2
 ```
 
-For OpenRouter prediction races:
+For OpenRouter prediction races/pricing:
 
 ```bash
 export OPENROUTER_API_KEY=your_key_here
+```
+
+Cost-aware race example:
+
+```text
+/predict-race ollama:llama3.2:latest,openrouter:auto
 ```
 
 ## Install locally
